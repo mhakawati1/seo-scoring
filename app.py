@@ -157,7 +157,70 @@ def load_excel(uploaded_file) -> pd.DataFrame:
     return df
 
 
-def parse_response_text(response: Any) -> Dict[str, Any]:
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="seo_scored")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def color_score(val):
+    try:
+        v = float(val)
+    except Exception:
+        return ""
+    if v >= 8:
+        return "background-color: rgba(52,199,89,0.25)"
+    if v >= 6:
+        return "background-color: rgba(255,204,0,0.25)"
+    return "background-color: rgba(255,69,58,0.25)"
+
+
+def make_gemini_safe_schema(schema: Any) -> Any:
+    """
+    Remove JSON Schema fields Gemini may reject.
+    """
+    if isinstance(schema, dict):
+        cleaned = {}
+        for key, value in schema.items():
+            if key in {"additionalProperties", "$schema"}:
+                continue
+            cleaned[key] = make_gemini_safe_schema(value)
+        return cleaned
+    if isinstance(schema, list):
+        return [make_gemini_safe_schema(item) for item in schema]
+    return schema
+
+
+GEMINI_RESPONSE_SCHEMA = make_gemini_safe_schema(RESPONSE_JSON_SCHEMA["schema"])
+
+
+# ------------------------------
+# Provider clients
+# ------------------------------
+def get_openai_client(api_key: Optional[str] = None):
+    from openai import OpenAI
+
+    final_api_key = clean_text(api_key) or os.getenv("OPENAI_API_KEY", "")
+    if not final_api_key:
+        raise RuntimeError("OpenAI API key is not set. Add it in the UI or as OPENAI_API_KEY.")
+    return OpenAI(api_key=final_api_key)
+
+
+def get_gemini_client(api_key: Optional[str] = None):
+    from google import genai
+
+    final_api_key = clean_text(api_key) or os.getenv("GEMINI_API_KEY", "")
+    if not final_api_key:
+        raise RuntimeError("Gemini API key is not set. Add it in the UI or as GEMINI_API_KEY.")
+    return genai.Client(api_key=final_api_key)
+
+
+# ------------------------------
+# Provider scoring
+# ------------------------------
+def parse_openai_response_text(response: Any) -> Dict[str, Any]:
     text = getattr(response, "output_text", "")
     if text:
         return json.loads(text)
@@ -168,19 +231,10 @@ def parse_response_text(response: Any) -> Dict[str, Any]:
             if maybe_text:
                 return json.loads(maybe_text)
 
-    raise ValueError("Could not find JSON text in model response.")
+    raise ValueError("Could not find JSON text in OpenAI response.")
 
 
-def get_client(api_key: Optional[str] = None):
-    from openai import OpenAI
-
-    final_api_key = clean_text(api_key) or os.getenv("OPENAI_API_KEY", "")
-    if not final_api_key:
-        raise RuntimeError("OpenAI API key is not set. Add it in the UI or as OPENAI_API_KEY.")
-    return OpenAI(api_key=final_api_key)
-
-
-def score_article(client: Any, model: str, title: str, body: str, url: str) -> Dict[str, Any]:
+def score_article_openai(client: Any, model: str, title: str, body: str, url: str) -> Dict[str, Any]:
     user_prompt = f"""
 قيّم هذا المقال:
 
@@ -204,18 +258,70 @@ url: {url}
             }
         },
     )
-    return parse_response_text(response)
+    return parse_openai_response_text(response)
 
 
+def score_article_gemini(client: Any, model: str, title: str, body: str, url: str) -> Dict[str, Any]:
+    from google.genai import types
+
+    user_prompt = f"""
+قيّم هذا المقال:
+
+title: {title}
+body: {body}
+url: {url}
+""".strip()
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SEO_DEVELOPER_PROMPT,
+            response_mime_type="application/json",
+            response_schema=GEMINI_RESPONSE_SCHEMA,
+        ),
+    )
+
+    text = getattr(response, "text", None)
+    if not text:
+        raise ValueError("Gemini response did not include text.")
+    return json.loads(text)
+
+
+def score_article(
+    provider: str,
+    client: Any,
+    model: str,
+    title: str,
+    body: str,
+    url: str,
+) -> Dict[str, Any]:
+    if provider == "OpenAI":
+        return score_article_openai(client, model, title, body, url)
+    if provider == "Gemini":
+        return score_article_gemini(client, model, title, body, url)
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+# ------------------------------
+# Processing
+# ------------------------------
 def process_dataframe(
     df: pd.DataFrame,
+    provider: str,
     model: str,
     max_rows: Optional[int] = None,
     api_key: Optional[str] = None,
     max_workers: int = 5,
 ) -> pd.DataFrame:
     working_df = df.copy()
-    client = get_client(api_key=api_key)
+
+    if provider == "OpenAI":
+        client = get_openai_client(api_key=api_key)
+    elif provider == "Gemini":
+        client = get_gemini_client(api_key=api_key)
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
 
     for col in SCORE_COLUMNS:
         if col not in working_df.columns:
@@ -244,7 +350,14 @@ def process_dataframe(
             return idx, {"processing_status": "Skipped: empty title and body"}
 
         try:
-            result = score_article(client=client, model=model, title=title, body=body, url=url)
+            result = score_article(
+                provider=provider,
+                client=client,
+                model=model,
+                title=title,
+                body=body,
+                url=url,
+            )
             return idx, {
                 "title_seo_score": result.get("title_seo_score", ""),
                 "body_seo_score": result.get("body_seo_score", ""),
@@ -282,28 +395,8 @@ def process_dataframe(
     return working_df
 
 
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="seo_scored")
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def color_score(val):
-    try:
-        v = float(val)
-    except Exception:
-        return ""
-    if v >= 8:
-        return "background-color: rgba(52,199,89,0.25)"
-    if v >= 6:
-        return "background-color: rgba(255,204,0,0.25)"
-    return "background-color: rgba(255,69,58,0.25)"
-
-
 # ------------------------------
-# Streamlit App
+# Streamlit app
 # ------------------------------
 if "processed_df" not in st.session_state:
     st.session_state["processed_df"] = None
@@ -350,13 +443,17 @@ with st.container(border=True):
         )
 
     with right_col:
-        model_name = st.text_input("Model", value="gpt-4.1-mini")
+        provider = st.selectbox("Provider", ["OpenAI", "Gemini"])
+        default_model = "gpt-4.1-mini" if provider == "OpenAI" else "gemini-3.1-flash-lite-preview"
+        model_name = st.text_input("Model", value=default_model)
+
         api_key_input = st.text_input(
-            "OpenAI API key",
+            "API key",
             type="password",
-            placeholder="sk-...",
+            placeholder="sk-..." if provider == "OpenAI" else "AIza...",
             help="Used only for this session in the running app.",
         )
+
         process_limit = st.number_input("Rows to process", min_value=1, value=20, step=1)
         max_workers = st.slider("Parallel requests", min_value=1, max_value=8, value=5, step=1)
 
@@ -372,7 +469,7 @@ with st.expander("Expected format", expanded=False):
         "suggested_seo_title"
     )
     st.markdown("API key:")
-    st.code("Paste your API key in the UI field above, or set OPENAI_API_KEY in your environment.")
+    st.code("Paste your OpenAI or Gemini API key in the UI field above.")
 
 if not uploaded_file:
     st.info("Upload an Excel file to begin.")
@@ -400,6 +497,7 @@ if st.button("Run SEO scoring", type="primary", width="stretch"):
     try:
         processed_df = process_dataframe(
             df,
+            provider=provider,
             model=model_name,
             max_rows=process_limit,
             api_key=api_key_input,
